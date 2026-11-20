@@ -1,0 +1,104 @@
+name: Compilar fuckstudy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      # Busca la carpeta del proyecto (la que tiene settings.gradle.kts), esté en la raíz
+      # del repositorio, en una subcarpeta («minibunker/») o dentro de un ZIP subido tal cual.
+      - name: Localizar el proyecto
+        id: loc
+        run: |
+          f=$(find . -maxdepth 4 -name settings.gradle.kts -not -path "*/build/*" -not -path "./_proyecto/*" | head -n 1)
+          if [ -z "$f" ]; then
+            # Prioridad: fuckstudy.zip; si no está, el primer .zip que haya (p. ej. un minibunker.zip antiguo).
+            z=$(find . -maxdepth 2 -iname "fuckstudy*.zip" -not -path "./.git/*" | head -n 1)
+            [ -z "$z" ] && z=$(find . -maxdepth 2 -name "*.zip" -not -path "./.git/*" | head -n 1)
+            if [ -n "$z" ]; then
+              echo "Descomprimiendo $z"
+              rm -rf _proyecto && mkdir -p _proyecto && unzip -q -o "$z" -d _proyecto
+              f=$(find _proyecto -maxdepth 4 -name settings.gradle.kts -not -path "*/build/*" | head -n 1)
+            fi
+          fi
+          if [ -z "$f" ]; then
+            echo "::error::No encuentro settings.gradle.kts. Sube fuckstudy.zip o el contenido de su carpeta (settings.gradle.kts, build.gradle.kts, app/...)."
+            echo "Contenido del repositorio:"; find . -maxdepth 3 -not -path "./.git*" | head -n 80
+            exit 1
+          fi
+          dir=$(dirname "$f")
+          echo "Proyecto en: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          ls -la "$dir" "$dir/app"
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Android SDK (API 35)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      # Gradle 8.14.3 directamente (misma versión que el wrapper): no depende del permiso
+      # de ejecución de gradlew ni de la validación de su .jar.
+      - name: Preparar Gradle 8.14.3
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+          build-root-directory: ${{ steps.loc.outputs.dir }}
+
+      # Si falla, los errores reales (líneas «e: …» de Kotlin y «What went wrong» de Gradle) se muestran
+      # arriba del todo como anotaciones y en el resumen de la ejecución, sin buscar en el registro.
+      - name: Compilar el APK de depuración
+        working-directory: ${{ steps.loc.outputs.dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          if gradle assembleDebug --no-daemon --warning-mode=summary 2>&1 | tee build.log; then exit 0; fi
+          {
+            echo "## ❌ Errores de compilación"
+            echo '```'
+            grep -E "^e: |error:|What went wrong" -A3 build.log | grep -v "^--$" | head -n 120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: " build.log | head -n 40 | while read -r line; do echo "::error::${line}"; done
+          grep -A6 "What went wrong" build.log | head -n 30
+          exit 1
+
+      # El APK se publica antes de las pruebas: si alguna prueba falla, el APK sigue disponible.
+      - name: Publicar el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuckstudy-debug-apk
+          path: ${{ steps.loc.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Ejecutar las pruebas unitarias
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Publicar informes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informes
+          path: |
+            ${{ steps.loc.outputs.dir }}/app/build/reports/
+            ${{ steps.loc.outputs.dir }}/build/reports/
+          if-no-files-found: ignore
